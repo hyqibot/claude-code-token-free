@@ -1,0 +1,1132 @@
+import { ApiError } from '../middleware/errorHandler.js'
+import {
+  ensureUrlsForCanonicalModelId,
+  getZeroTokenWebModels,
+  onboardModeForCanonicalModelId,
+} from '../config/zeroTokenWebModels.js'
+import { existsSync, readFileSync } from 'fs'
+import { homedir } from 'os'
+import { join, dirname } from 'path'
+import { access, mkdir, readFile, rm, writeFile } from 'fs/promises'
+import { constants as fsConstants } from 'fs'
+import { createConnection } from 'net'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { SettingsService } from './settingsService.js'
+import { mergeNoProxyEnvVars } from '../utils/loopbackFetchEnv.js'
+
+/**
+ * Node 内置 fetch (undici) 不读 NODE_TLS_REJECT_UNAUTHORIZED，必须 setGlobalDispatcher。
+ * cc-haha spawn gateway 时若用户启用 insecureTls，就通过 `--import` 注入这段 shim，
+ * 让 gateway 全部 fetch 走 `rejectUnauthorized: false` 的 dispatcher。
+ */
+const ZERO_TOKEN_TLS_SHIM_PATH = join(
+  dirname(fileURLToPath(import.meta.url)),
+  'zeroTokenGatewayTlsShim.mjs',
+)
+
+export type ZeroTokenGatewayStatus = {
+  listening: boolean
+  pid: number | null
+  host: string | null
+  port: number | null
+  raw: string
+}
+
+/** DeepSeek 工具链：dsml（默认，StreamSieve + DSML prompt）| xml（Doubao 式 <tool_call>）。 */
+export type DeepseekToolMode = 'dsml' | 'xml'
+
+const DEFAULT_DEEPSEEK_TOOL_MODE: DeepseekToolMode = 'dsml'
+
+const STATUS_REGEX = /listening=(true|false)\s+pid=(-?\d+)\s+([0-9a-zA-Z\.\-]+):(\d+)/
+const DEFAULT_HOST = '127.0.0.1'
+const DEFAULT_PORT = 3002
+const START_WAIT_MS = 30_000
+const START_POLL_INTERVAL_MS = 200
+const DEFAULT_ENSURE_CHROME_DEBUG_MS = 90_000
+const DEFAULT_ONBOARD_TIMEOUT_MS = 180_000
+
+const SUPPORTED_ONBOARD_MODES = [
+  'webauth',
+  'doubao',
+  'claude',
+  'qwen',
+  'qwen-cn',
+  'kimi',
+  'chatgpt',
+  'gemini',
+  'glm',
+  'glm-intl',
+  'chrome-debug',
+] as const
+
+type ZeroTokenMode = (typeof SUPPORTED_ONBOARD_MODES)[number]
+
+type CommandResult = {
+  exitCode: number
+  output: string
+}
+
+const COPAW_ENSURE_CHROME_DEBUG_SCRIPT = `import json,os,sys
+try:
+    from copaw.zero_token.webauth import ensure_chrome_debug
+    raw=os.environ.get("COPAW_ENSURE_URLS_JSON","[]")
+    urls=json.loads(raw)
+    r=ensure_chrome_debug(urls=urls)
+    print(json.dumps({"ok":True,"result":r}))
+except Exception as e:
+    print(json.dumps({"ok":False,"error":str(e)}))
+    sys.exit(1)
+`
+
+/** CoPaw `start_chrome_debug_keepalive`：后台线程保活 CDP + 目标页（与 CoPaw ProviderManager 侧一致的单例语义在同一 Python 进程内；此处单独子进程承载） */
+const COPAW_KEEPALIVE_SCRIPT = `import json,os,sys,threading
+from copaw.zero_token.webauth import start_chrome_debug_keepalive
+urls=json.loads(os.environ.get("COPAW_KEEPALIVE_URLS_JSON","[]"))
+start_chrome_debug_keepalive(urls=urls, interval_sec=20.0)
+threading.Event().wait()
+`
+
+/** Vendored CoPaw zero-token Python (see `vendor/copaw-zero-token/`). */
+const VENDOR_ZT_CLI_SEGMENTS = ['vendor', 'copaw-zero-token', 'python', 'copaw_zt_cli.py'] as const
+
+let cachedRepoRoot: string | null = null
+
+function findCcHahaRepoRoot(startDir: string): string {
+  let dir = startDir
+  for (let i = 0; i < 16; i++) {
+    const marker = join(dir, ...VENDOR_ZT_CLI_SEGMENTS)
+    if (existsSync(marker)) return dir
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  throw new Error(
+    '未找到 cc-haha 仓库根目录下的 vendor/copaw-zero-token。可设置环境变量 CC_HAHA_ROOT 指向仓库根路径。',
+  )
+}
+
+function getCcHahaRepoRoot(): string {
+  if (cachedRepoRoot) return cachedRepoRoot
+  const envRoot = process.env.CC_HAHA_ROOT?.trim()
+  if (envRoot) {
+    const marker = join(envRoot, ...VENDOR_ZT_CLI_SEGMENTS)
+    if (existsSync(marker)) {
+      cachedRepoRoot = envRoot
+      return cachedRepoRoot
+    }
+  }
+  const here = dirname(fileURLToPath(import.meta.url))
+  cachedRepoRoot = findCcHahaRepoRoot(here)
+  return cachedRepoRoot
+}
+
+function pythonPathWithVendor(): string {
+  const root = getCcHahaRepoRoot()
+  const vendorSrc = join(root, 'vendor', 'copaw-zero-token', 'python', 'src')
+  const prev = process.env.PYTHONPATH?.trim()
+  const sep = process.platform === 'win32' ? ';' : ':'
+  return prev ? `${vendorSrc}${sep}${prev}` : vendorSrc
+}
+
+function buildPythonEnv(extra?: Record<string, string | undefined>): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  if (extra) {
+    for (const [k, v] of Object.entries(extra)) {
+      if (v !== undefined) env[k] = v
+    }
+  }
+  env.PYTHONPATH = pythonPathWithVendor()
+  // Windows 上 Python 默认可能用系统代码页写 piped stdout，按 UTF-8 解码会乱码；强制 UTF-8 与 NDJSON 一致
+  if (!env.PYTHONIOENCODING?.trim()) env.PYTHONIOENCODING = 'utf-8'
+  if (!env.PYTHONUTF8?.trim()) env.PYTHONUTF8 = '1'
+  // Playwright connect_over_cdp：ws 已连上仍可能握手超时；未显式配置时加大默认时限（与 vendor webauth 默认一致）
+  if (!env.COPAW_CDP_CONNECT_TIMEOUT_MS?.trim() && !env.COPAW_ZERO_TOKEN_CDP_CONNECT_MS?.trim()) {
+    env.COPAW_CDP_CONNECT_TIMEOUT_MS = '60000'
+  }
+  return env
+}
+
+/**
+ * 与 `vendor/copaw-zero-token/.../zero_token_gateway/config.mjs` 一致：
+ * `COPAW_ZERO_TOKEN_*` 优先，其次 `ICLAW_ZERO_TOKEN_*`（上游别名）。
+ * 仅设置 ICLAW 而 cc-haha 只读 COPAW 时，CLI 仍会连默认 3002，网关却在其它端口 → 「Unable to connect」。
+ */
+function pickZeroTokenEnv(primary: string, fallback: string): string | undefined {
+  const a = process.env[primary]?.trim()
+  if (a) return a
+  const b = process.env[fallback]?.trim()
+  return b || undefined
+}
+
+function getGatewayHost(): string {
+  return pickZeroTokenEnv('COPAW_ZERO_TOKEN_HOST', 'ICLAW_ZERO_TOKEN_HOST') || DEFAULT_HOST
+}
+
+function getGatewayPort(): number {
+  const raw = pickZeroTokenEnv('COPAW_ZERO_TOKEN_PORT', 'ICLAW_ZERO_TOKEN_PORT')
+  const parsed = raw ? Number.parseInt(raw, 10) : NaN
+  if (Number.isFinite(parsed) && parsed > 0) return parsed
+  return DEFAULT_PORT
+}
+
+/** 与 Node 网关监听地址一致；Zero-Token 预设下行 CLI 应使用此 URL，避免 providers.json 里陈旧 baseUrl 与端口漂移。 */
+export function getZeroTokenGatewayHttpBase(): string {
+  const base = `http://${getGatewayHost()}:${getGatewayPort()}`
+  return base.replace(/\/+$/, '')
+}
+
+function getPidFilePath(): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  return join(configDir, 'cc-haha', 'zero-token-gateway.pid')
+}
+
+function getCcHahaSettingsPath(): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  return join(configDir, 'cc-haha', 'settings.json')
+}
+
+export function readDeepseekToolMode(): DeepseekToolMode {
+  try {
+    const raw = readFileSync(getCcHahaSettingsPath(), 'utf8')
+    const parsed = JSON.parse(raw) as { deepseekToolMode?: unknown }
+    return parsed.deepseekToolMode === 'xml' ? 'xml' : 'dsml'
+  } catch {
+    return DEFAULT_DEEPSEEK_TOOL_MODE
+  }
+}
+
+export async function setDeepseekToolMode(mode: DeepseekToolMode): Promise<void> {
+  const path = getCcHahaSettingsPath()
+  await mkdir(dirname(path), { recursive: true })
+  let current: Record<string, unknown> = {}
+  try {
+    current = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+  } catch {
+    // fresh file
+  }
+  const next = { ...current, deepseekToolMode: mode }
+  await writeFile(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+}
+
+function getKeepalivePidFilePath(): string {
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  return join(configDir, 'cc-haha', 'zero-token-keepalive.pid')
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path, fsConstants.F_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function readPidFromFile(): Promise<number | null> {
+  try {
+    const raw = (await readFile(getPidFilePath(), 'utf8')).trim()
+    const pid = Number.parseInt(raw, 10)
+    return Number.isFinite(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+async function writePidFile(pid: number): Promise<void> {
+  const file = getPidFilePath()
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(file, `${pid}\n`, 'utf8')
+}
+
+async function removePidFile(): Promise<void> {
+  await rm(getPidFilePath(), { force: true }).catch(() => undefined)
+}
+
+async function isPortListening(host: string, port: number): Promise<boolean> {
+  return await new Promise((resolve) => {
+    const socket = createConnection({ host, port })
+    let settled = false
+    const done = (value: boolean) => {
+      if (settled) return
+      settled = true
+      try {
+        socket.destroy()
+      } catch {
+        // ignore socket destroy failure
+      }
+      resolve(value)
+    }
+    socket.setTimeout(500)
+    socket.on('connect', () => done(true))
+    socket.on('timeout', () => done(false))
+    socket.on('error', () => done(false))
+  })
+}
+
+/** TCP 已开但 HTTP 未就绪时 CLI 会报 Unable to connect；等 /health 200 再返回。 */
+async function isGatewayHttpReady(host: string, port: number): Promise<boolean> {
+  if (!(await isPortListening(host, port))) return false
+  try {
+    const res = await fetch(`http://${host}:${port}/health`, {
+      signal: AbortSignal.timeout(2500),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+export function parseZeroTokenStatus(output: string): ZeroTokenGatewayStatus {
+  const match = output.match(STATUS_REGEX)
+  if (!match) {
+    return {
+      listening: false,
+      pid: null,
+      host: null,
+      port: null,
+      raw: output.trim(),
+    }
+  }
+
+  const listening = match[1] === 'true'
+  const pidNum = Number.parseInt(match[2], 10)
+  const portNum = Number.parseInt(match[4], 10)
+
+  return {
+    listening,
+    pid: Number.isFinite(pidNum) && pidNum > 0 ? pidNum : null,
+    host: match[3] || null,
+    port: Number.isFinite(portNum) ? portNum : null,
+    raw: output.trim(),
+  }
+}
+
+async function drainReadableLines(
+  stream: ReadableStream<Uint8Array> | undefined,
+  onLine: (line: string) => void,
+  accumulate: (chunk: string) => void,
+): Promise<void> {
+  if (!stream) return
+  const reader = stream.getReader()
+  const dec = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true })
+  let pending = ''
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      pending += dec.decode(value, { stream: true })
+      const lines = pending.split(/\r?\n/)
+      pending = lines.pop() ?? ''
+      for (const line of lines) {
+        accumulate(`${line}\n`)
+        onLine(line)
+      }
+    }
+    if (pending.length > 0) {
+      accumulate(`${pending}\n`)
+      onLine(pending)
+    }
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** 并行读完 stdout/stderr，按行回调（与终端交错顺序接近），便于桌面显示 CoPaw CLI 进度 */
+async function drainSpawnPipeBothWithLines(
+  proc: {
+    stdout: ReadableStream<Uint8Array> | undefined
+    stderr: ReadableStream<Uint8Array> | undefined
+    exited: Promise<number | null>
+  },
+  onLine: (line: string) => void,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  let stdoutAcc = ''
+  let stderrAcc = ''
+  await Promise.all([
+    drainReadableLines(proc.stdout, onLine, (c) => {
+      stdoutAcc += c
+    }),
+    drainReadableLines(proc.stderr, onLine, (c) => {
+      stderrAcc += c
+    }),
+  ])
+  const exitCode = (await proc.exited) ?? 0
+  return { stdout: stdoutAcc, stderr: stderrAcc, exitCode }
+}
+
+async function runZeroTokenCommand(
+  args: string[],
+  timeoutMs: number = DEFAULT_ONBOARD_TIMEOUT_MS,
+  onLine?: (line: string) => void,
+): Promise<CommandResult> {
+  const externalCopaw = process.env.COPAW_ZERO_TOKEN_CLI?.trim()
+  const command = externalCopaw
+    ? [externalCopaw, 'zero-token', ...args]
+    : [await resolvePythonExe(), join(getCcHahaRepoRoot(), ...VENDOR_ZT_CLI_SEGMENTS), ...args]
+  const proc = Bun.spawn(command, {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: buildPythonEnv(),
+  })
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  if (timeoutMs > 0) {
+    timeoutId = setTimeout(() => {
+      try {
+        proc.kill()
+      } catch {
+        // ignore kill errors on timeout
+      }
+    }, timeoutMs)
+  }
+
+  const lineCb = onLine ?? (() => {})
+  try {
+    const { stdout: stdoutText, stderr: stderrText, exitCode } = await drainSpawnPipeBothWithLines(proc, lineCb)
+    const output = `${stdoutText}\n${stderrText}`.trim()
+    return { exitCode, output }
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId)
+  }
+}
+
+/** Zero-Token 一键授权 / onboard 使用的 Python（避免 PATH 里其它 venv 的 `python` 抢先）。 */
+export async function resolvePythonExe(): Promise<string> {
+  const explicit = process.env.COPAW_ZERO_TOKEN_PYTHON?.trim()
+  if (explicit) return explicit
+
+  const externalCopaw = process.env.COPAW_ZERO_TOKEN_CLI?.trim()
+  if (externalCopaw) {
+    const scriptsDir = dirname(externalCopaw)
+    const low = scriptsDir.toLowerCase()
+    if (low.endsWith('\\scripts') || low.endsWith('/scripts')) {
+      const root = join(scriptsDir, '..')
+      const winPy = join(root, 'python.exe')
+      if (await pathExists(winPy)) return winPy
+      const u3 = join(root, 'bin', 'python3')
+      if (await pathExists(u3)) return u3
+      const u = join(root, 'bin', 'python')
+      if (await pathExists(u)) return u
+    }
+  }
+
+  const condaPrefix = process.env.CONDA_PREFIX?.trim()
+  if (condaPrefix) {
+    if (process.platform === 'win32') {
+      const winPy = join(condaPrefix, 'python.exe')
+      if (await pathExists(winPy)) return winPy
+    } else {
+      const u3 = join(condaPrefix, 'bin', 'python3')
+      if (await pathExists(u3)) return u3
+      const u = join(condaPrefix, 'bin', 'python')
+      if (await pathExists(u)) return u
+    }
+  }
+
+  return process.platform === 'win32' ? 'python' : 'python3'
+}
+
+function zeroTokenPlaywrightInstallHint(pythonExe: string): string {
+  const root = getCcHahaRepoRoot()
+  const req = join(root, 'vendor', 'copaw-zero-token', 'python', 'requirements.txt')
+  return (
+    `\n\nZero-Token 需要 Python Playwright（步骤 1 ensure_chrome_debug）。当前解释器：${pythonExe}\n` +
+    `请执行：\n  "${pythonExe}" -m pip install -r "${req}"\n  "${pythonExe}" -m playwright install chromium\n` +
+    `若已激活 conda 环境仍失败，可显式设置 COPAW_ZERO_TOKEN_PYTHON 指向该环境的 python.exe，并重启 cc-haha server。`
+  )
+}
+
+function parseEnsureChromeDebugJsonOutput(output: string): { ok: boolean; result?: unknown; error?: string } {
+  const t = output.trim()
+  for (const line of t.split(/\r?\n/).reverse()) {
+    const s = line.trim()
+    if (s.startsWith('{') && s.endsWith('}')) {
+      try {
+        return JSON.parse(s) as { ok: boolean; result?: unknown; error?: string }
+      } catch {
+        // continue
+      }
+    }
+  }
+  const end = t.lastIndexOf('}')
+  const start = t.lastIndexOf('{', end)
+  if (start !== -1 && end > start) {
+    try {
+      return JSON.parse(t.slice(start, end + 1)) as { ok: boolean; result?: unknown; error?: string }
+    } catch {
+      // fall through
+    }
+  }
+  throw new Error('ensure_chrome_debug: no JSON in subprocess output')
+}
+
+function isCdpConnectTimeout(output: string): boolean {
+  const s = (output || '').toLowerCase()
+  return (
+    s.includes('connect_over_cdp') &&
+    (s.includes('timeout') || s.includes('timeouterror') || s.includes('exceeded'))
+  )
+}
+
+function withCopawAlignedHint(rawMessage: string, mode: string): string {
+  const base = (rawMessage || '').trim()
+  const normalized = (mode || '').trim().toLowerCase()
+
+  if (normalized !== 'chrome-debug' && isCdpConnectTimeout(base)) {
+    return [
+      base,
+      '',
+      '提示：该错误通常表示 9222 上的 Chrome CDP 与当前 Playwright 不兼容，或调试实例尚未就绪（已与 ws 建立连接但仍握手超时）。',
+      '请关闭占用 9222 的旧浏览器进程后重试；或在终端执行 `copaw zero-token onboard chrome-debug` 单独拉起调试实例，再点一键授权。',
+      '若混用多套 Chrome/Chromium，请保证 `ensure_chrome_debug` 拉起的与 Playwright 内置 Chromium 版本匹配（参见 CoPaw 文档）。',
+      '握手仍超时可在启动 cc-haha 的终端加大 `COPAW_CDP_CONNECT_TIMEOUT_MS`（或 `COPAW_ZERO_TOKEN_CDP_CONNECT_MS`，上限 180000）。',
+    ].join('\n')
+  }
+
+  return base
+}
+
+function isCopawZeroTokenOnboardSuccess(exitCode: number, output: string): boolean {
+  if (exitCode === 0) return true
+  const o = (output || '').trim()
+  if (!o) return false
+  if (o.toLowerCase().includes('traceback')) return false
+  if (exitCode !== 1) return false
+  return o.includes('授权完成') || o.includes('已启动浏览器调试模式')
+}
+
+async function readKeepalivePid(): Promise<number | null> {
+  try {
+    const raw = (await readFile(getKeepalivePidFilePath(), 'utf8')).trim()
+    const pid = Number.parseInt(raw, 10)
+    return Number.isFinite(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+async function writeKeepalivePid(pid: number): Promise<void> {
+  const file = getKeepalivePidFilePath()
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(file, `${pid}\n`, 'utf8')
+}
+
+async function removeKeepalivePidFile(): Promise<void> {
+  await rm(getKeepalivePidFilePath(), { force: true }).catch(() => undefined)
+}
+
+async function killPreviousKeepalive(): Promise<void> {
+  const pid = await readKeepalivePid()
+  if (!pid) return
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    // ignore
+  }
+  await removeKeepalivePidFile()
+}
+
+async function resolveGatewayEntryPath(): Promise<string | null> {
+  const preferred = process.env.COPAW_ZERO_TOKEN_GATEWAY_ENTRY?.trim()
+  if (preferred && await pathExists(preferred)) return preferred
+
+  const bundled = join(
+    getCcHahaRepoRoot(),
+    'vendor',
+    'copaw-zero-token',
+    'python',
+    'src',
+    'copaw',
+    'zero_token_gateway',
+    'server.mjs',
+  )
+  if (await pathExists(bundled)) return bundled
+  return null
+}
+
+/** 懒安装：首次拉起 Node 网关前在 `zero_token_gateway` 目录装 `playwright-core`；已存在则跳过。 */
+let gatewayNpmInstallPromise: Promise<void> | null = null
+
+async function ensureZeroTokenGatewayNpmDeps(gatewayDir: string): Promise<void> {
+  const marker = join(gatewayDir, 'node_modules', 'playwright-core')
+  if (await pathExists(marker)) return
+
+  if (process.env.CC_HAHA_ZERO_TOKEN_AUTO_NPM?.trim() === '0') {
+    throw ApiError.internal(
+      `Zero-Token 网关缺少 Node 依赖（未找到 ${marker}）。请在该目录执行 npm install，或删除环境变量 CC_HAHA_ZERO_TOKEN_AUTO_NPM=0 以允许服务端首次启动时自动安装。`,
+    )
+  }
+
+  if (!gatewayNpmInstallPromise) {
+    gatewayNpmInstallPromise = (async () => {
+      try {
+        const proc = Bun.spawn(['npm', 'install', '--omit=dev', '--no-audit', '--no-fund', '--loglevel', 'error'], {
+          cwd: gatewayDir,
+          stdout: 'pipe',
+          stderr: 'pipe',
+          env: process.env,
+        })
+        const stderrText = proc.stderr ? await new Response(proc.stderr).text() : ''
+        const stdoutText = proc.stdout ? await new Response(proc.stdout).text() : ''
+        const exitCode = (await proc.exited) ?? 1
+        if (exitCode !== 0) {
+          throw ApiError.internal(
+            `Zero-Token 网关自动 npm install 失败（exit ${exitCode}）。可手动执行：npm install --prefix "${gatewayDir}"\n${stderrText}\n${stdoutText}`,
+          )
+        }
+        if (!(await pathExists(marker))) {
+          throw ApiError.internal(
+            `Zero-Token 网关 npm install 已完成但未找到 playwright-core，请检查 ${gatewayDir}`,
+          )
+        }
+      } catch (err) {
+        gatewayNpmInstallPromise = null
+        throw err
+      }
+      gatewayNpmInstallPromise = null
+    })()
+  }
+
+  await gatewayNpmInstallPromise
+}
+
+/**
+ * 当用户启用 insecureTls 时，spawn gateway 子进程要附带的 env：
+ * - `NODE_TLS_REJECT_UNAUTHORIZED=0`：让 `https.request` / 旧 `http(s).Agent` 路径跳校验
+ * - `COPAW_INSECURE_TLS=1`：让 TLS shim 在 `--import` 时识别开关
+ *
+ * 注意：Node 内置 fetch (undici) 不读上述任一 env，必须配合 spawn args 里的 --import shim
+ * 才能让 fetch 跳校验。这里只负责 env，args 由 buildGatewaySpawnArgs 单独决定。
+ */
+/** 本机配置了常见代理环境变量时，网关访问上游网页 API 常因 MITM 自签 CA 触发证书错误。 */
+function shouldUseInsecureTlsForGateway(): boolean {
+  if (new SettingsService().isInsecureTlsEnabled()) return true
+  const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy'] as const
+  return keys.some((k) => {
+    const v = process.env[k]?.trim()
+    return Boolean(v)
+  })
+}
+
+export function buildGatewaySpawnInsecureTlsEnv(
+  isInsecureTls: boolean,
+): Record<string, string> {
+  return isInsecureTls
+    ? { NODE_TLS_REJECT_UNAUTHORIZED: '0', COPAW_INSECURE_TLS: '1' }
+    : {}
+}
+
+/**
+ * 拼接 spawn 用的命令行：基础 `node <entry>`；启用 insecureTls 且 shim 存在时插入
+ * `--import <shimUrl>` 让 gateway 全局 fetch 跳 TLS 校验。
+ */
+export function buildGatewaySpawnArgs(params: {
+  nodeBin: string
+  entryPath: string
+  isInsecureTls: boolean
+  shimPath: string
+  shimExists: boolean
+}): string[] {
+  const args = [params.nodeBin]
+  if (params.isInsecureTls && params.shimExists) {
+    args.push('--import', pathToFileURL(params.shimPath).href)
+  }
+  args.push(params.entryPath)
+  return args
+}
+
+/** 并发 `start()` 时只跑一条 spawn，避免双进程抢 3002。 */
+let zeroTokenGatewayStartPromise: Promise<ZeroTokenGatewayStatus> | null = null
+
+async function startGatewayDirect(port?: number): Promise<ZeroTokenGatewayStatus> {
+  const host = getGatewayHost()
+  const finalPort = typeof port === 'number' && Number.isFinite(port) ? Math.trunc(port) : getGatewayPort()
+  if (await isGatewayHttpReady(host, finalPort)) {
+    const pid = await readPidFromFile()
+    return {
+      listening: true,
+      pid,
+      host,
+      port: finalPort,
+      raw: `direct: already listening pid=${pid ?? 'unknown'} ${host}:${finalPort}`,
+    }
+  }
+
+  if (zeroTokenGatewayStartPromise) {
+    return zeroTokenGatewayStartPromise
+  }
+
+  zeroTokenGatewayStartPromise = startGatewayDirectBody(host, finalPort).finally(() => {
+    zeroTokenGatewayStartPromise = null
+  })
+  return zeroTokenGatewayStartPromise
+}
+
+async function startGatewayDirectBody(
+  host: string,
+  finalPort: number,
+): Promise<ZeroTokenGatewayStatus> {
+  if (await isGatewayHttpReady(host, finalPort)) {
+    const pid = await readPidFromFile()
+    return {
+      listening: true,
+      pid,
+      host,
+      port: finalPort,
+      raw: `direct: already listening (serialized) pid=${pid ?? 'unknown'} ${host}:${finalPort}`,
+    }
+  }
+
+  const entryPath = await resolveGatewayEntryPath()
+  if (!entryPath) {
+    throw ApiError.internal('Zero-Token gateway entry not found. Set COPAW_ZERO_TOKEN_GATEWAY_ENTRY to server.mjs path.')
+  }
+
+  const gatewayDir = dirname(entryPath)
+  await ensureZeroTokenGatewayNpmDeps(gatewayDir)
+
+  const nodeBin = process.env.COPAW_ZERO_TOKEN_NODE?.trim() || 'node'
+  let stderrTail = ''
+  /**
+   * 桌面端 Settings → "在 HTTPS 代理下信任所有证书" 勾上时，让 gateway 对上游 LLM web
+   * 的 TLS 校验也跳过（否则会以 "API Error: unknown certificate verification error" 抛出）。
+   * 仅 cc-haha 启动 gateway 时按 settings 注入；用户手动启动 gateway 时自己设 env。
+   */
+  const isInsecureTls = shouldUseInsecureTlsForGateway()
+  const insecureTlsEnv = buildGatewaySpawnInsecureTlsEnv(isInsecureTls)
+
+  const spawnArgs = buildGatewaySpawnArgs({
+    nodeBin,
+    entryPath,
+    isInsecureTls,
+    shimPath: ZERO_TOKEN_TLS_SHIM_PATH,
+    shimExists: existsSync(ZERO_TOKEN_TLS_SHIM_PATH),
+  })
+
+  console.log(
+    `[ZeroTokenService] spawn gateway: ${spawnArgs.join(' ')} ` +
+      `(NODE_TLS_REJECT_UNAUTHORIZED=${insecureTlsEnv.NODE_TLS_REJECT_UNAUTHORIZED ?? '(unset)'}, ` +
+      `COPAW_INSECURE_TLS=${insecureTlsEnv.COPAW_INSECURE_TLS ?? '(unset)'})`,
+  )
+
+  const child = Bun.spawn(spawnArgs, {
+    cwd: gatewayDir,
+    env: {
+      ...process.env,
+      COPAW_ZERO_TOKEN_HOST: host,
+      COPAW_ZERO_TOKEN_PORT: String(finalPort),
+      ICLAW_ZERO_TOKEN_HOST: host,
+      ICLAW_ZERO_TOKEN_PORT: String(finalPort),
+      ...(process.env.COPAW_ZT_STREAM_DBG === '1' ? { COPAW_ZERO_TOKEN_STREAM_DEBUG: '1' } : {}),
+      COPAW_ZT_DEEPSEEK_TOOL_MODE: readDeepseekToolMode(),
+      ...insecureTlsEnv,
+      ...(() => {
+        const e = {} as Record<string, string>
+        mergeNoProxyEnvVars(e)
+        return e
+      })(),
+    },
+    stdin: 'ignore',
+    stdout: 'ignore',
+    stderr: 'pipe',
+  })
+
+  /**
+   * 把 gateway 的 stderr 实时按行带前缀转发到 server stderr，便于排查 gateway 内部
+   * console.warn / TLS / fetch 错误（之前 stderr 只在启动失败时输出，成功后被丢弃）。
+   * 同时仍保留最近 12KB 的 tail 用作启动失败时的错误附加。
+   */
+  let stderrLineBuf = ''
+  if (child.stderr) {
+    void (async () => {
+      const reader = child.stderr.getReader()
+      const dec = new TextDecoder()
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          const chunk = dec.decode(value, { stream: true })
+          stderrTail += chunk
+          if (stderrTail.length > 12_000) stderrTail = stderrTail.slice(-12_000)
+          stderrLineBuf += chunk
+          let idx: number
+          while ((idx = stderrLineBuf.indexOf('\n')) >= 0) {
+            const line = stderrLineBuf.slice(0, idx).replace(/\r$/, '')
+            stderrLineBuf = stderrLineBuf.slice(idx + 1)
+            if (line.length > 0) {
+              try {
+                process.stderr.write(`[zero-token-gateway] ${line}\n`)
+              } catch {
+                // ignore forward errors
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore drain errors
+      }
+    })()
+  }
+
+  const exitBox = { code: null as number | null, settled: false }
+  void child.exited
+    .then((c) => {
+      exitBox.code = c ?? 0
+      exitBox.settled = true
+    })
+    .catch(() => {
+      exitBox.code = -1
+      exitBox.settled = true
+    })
+
+  await writePidFile(child.pid)
+  const deadline = Date.now() + START_WAIT_MS
+  while (Date.now() < deadline) {
+    if (await isGatewayHttpReady(host, finalPort)) {
+      return {
+        listening: true,
+        pid: child.pid,
+        host,
+        port: finalPort,
+        raw: `direct: started pid=${child.pid} ${host}:${finalPort}`,
+      }
+    }
+    if (exitBox.settled && !(await isGatewayHttpReady(host, finalPort))) {
+      await sleep(120)
+      const errTail = stderrTail.trim().slice(-2500)
+      await removePidFile().catch(() => undefined)
+      throw ApiError.internal(
+        `Zero-Token gateway process exited before listening on ${host}:${finalPort} (exit=${exitBox.code}). ` +
+          `${nodeBin} ${entryPath}. ` +
+          (errTail ? `stderr:\n${errTail}` : '(no stderr; check Node 是否在 PATH，或设 COPAW_ZERO_TOKEN_NODE)'),
+      )
+    }
+    await sleep(START_POLL_INTERVAL_MS)
+  }
+
+  try {
+    child.kill()
+  } catch {
+    // ignore kill failures after timeout
+  }
+  await removePidFile()
+  await sleep(150)
+  const errTail = stderrTail.trim().slice(-2500)
+  throw ApiError.internal(
+    `Zero-Token gateway failed to listen on ${host}:${finalPort} within ${START_WAIT_MS}ms. ` +
+      `${nodeBin} ${entryPath}. ` +
+      (errTail
+        ? `stderr:\n${errTail}`
+        : `无 stderr。可在目录手动执行 node server.mjs 看报错：${gatewayDir}`),
+  )
+}
+
+async function statusGatewayDirect(): Promise<ZeroTokenGatewayStatus> {
+  const host = getGatewayHost()
+  const port = getGatewayPort()
+  const listening = await isGatewayHttpReady(host, port)
+  const pid = await readPidFromFile()
+  return {
+    listening,
+    pid,
+    host,
+    port,
+    raw: `direct: listening=${listening} pid=${pid ?? 'unknown'} ${host}:${port}`,
+  }
+}
+
+async function stopGatewayDirect(): Promise<ZeroTokenGatewayStatus> {
+  const host = getGatewayHost()
+  const port = getGatewayPort()
+  const pid = await readPidFromFile()
+  if (pid) {
+    try {
+      process.kill(pid, 'SIGTERM')
+    } catch {
+      // process might have already exited
+    }
+  }
+  await removePidFile()
+
+  const deadline = Date.now() + 2_500
+  while (Date.now() < deadline) {
+    if (!(await isPortListening(host, port))) {
+      return {
+        listening: false,
+        pid: null,
+        host,
+        port,
+        raw: `direct: stopped ${host}:${port}`,
+      }
+    }
+    await sleep(100)
+  }
+
+  return {
+    listening: await isPortListening(host, port),
+    pid: null,
+    host,
+    port,
+    raw: `direct: stop requested ${host}:${port}`,
+  }
+}
+
+export type ZeroTokenAuthorizeStreamEvent =
+  | { type: 'phase'; phase: 'ensure' | 'onboard' | 'keepalive' }
+  | { type: 'line'; text: string }
+  | {
+      type: 'complete'
+      result: {
+        modelId: string
+        ensure: { output: string; result: unknown }
+        onboard: { mode: string; output: string }
+      }
+    }
+
+export class ZeroTokenService {
+  getWebModels(): readonly { id: string; onboardMode: string }[] {
+    return getZeroTokenWebModels()
+  }
+
+  /**
+   * CoPaw `ensure_chrome_debug`：检测/拉起 9222 CDP，并按 urls 打开对应站点标签页（与 CoPaw HTTP 一键授权前置一致）。
+   */
+  async ensureChromeDebug(
+    urls: string[],
+    onLine?: (line: string) => void,
+  ): Promise<{ output: string; result: unknown }> {
+    if (!urls.length) {
+      throw ApiError.badRequest('ensure_chrome_debug requires at least one URL')
+    }
+    const py = await resolvePythonExe()
+    const proc = Bun.spawn([py, '-c', COPAW_ENSURE_CHROME_DEBUG_SCRIPT], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: buildPythonEnv({
+        COPAW_ENSURE_URLS_JSON: JSON.stringify(urls),
+      }),
+    })
+
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    timeoutId = setTimeout(() => {
+      try {
+        proc.kill()
+      } catch {
+        // ignore
+      }
+    }, DEFAULT_ENSURE_CHROME_DEBUG_MS)
+
+    const lineCb = onLine ?? (() => {})
+    let stdoutText = ''
+    let stderrText = ''
+    let exitCode = 0
+    try {
+      const drained = await drainSpawnPipeBothWithLines(proc, lineCb)
+      stdoutText = drained.stdout
+      stderrText = drained.stderr
+      exitCode = drained.exitCode
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId)
+    }
+
+    const output = `${stdoutText}\n${stderrText}`.trim()
+    let parsed: { ok: boolean; result?: unknown; error?: string }
+    try {
+      parsed = parseEnsureChromeDebugJsonOutput(output)
+    } catch {
+      throw ApiError.internal(
+        `ensure_chrome_debug failed to parse output (exit ${exitCode}). Install deps: pip install -r vendor/copaw-zero-token/python/requirements.txt && python -m playwright install chromium. Raw:\n${output}`,
+      )
+    }
+    if (!parsed.ok) {
+      const err = String(parsed.error || output || 'ensure_chrome_debug failed')
+      const hint =
+        /no module named ['"]playwright['"]/i.test(err) ? zeroTokenPlaywrightInstallHint(py) : ''
+      throw ApiError.internal(err + hint)
+    }
+    return { output, result: parsed.result ?? {} }
+  }
+
+  /** CLI `copaw zero-token onboard <mode>`（抓凭证写入）；mode 与 canonical model id 的映射见 `zeroTokenWebModels`。 */
+  async onboard(
+    mode: string,
+    onLine?: (line: string) => void,
+  ): Promise<{ mode: ZeroTokenMode; output: string }> {
+    const normalized = mode.trim().toLowerCase()
+    if (!SUPPORTED_ONBOARD_MODES.includes(normalized as ZeroTokenMode)) {
+      throw ApiError.badRequest(`Unsupported zero-token onboard mode: ${mode}`)
+    }
+    const result = await runZeroTokenCommand(['onboard', normalized], DEFAULT_ONBOARD_TIMEOUT_MS, onLine)
+    if (!isCopawZeroTokenOnboardSuccess(result.exitCode, result.output)) {
+      throw ApiError.internal(withCopawAlignedHint(result.output, normalized))
+    }
+    return { mode: normalized as ZeroTokenMode, output: result.output }
+  }
+
+  /**
+   * 与 CoPaw `zero_token.py` 各 `/…/webauth/start` 一致：先 `ensure_chrome_debug(urls)`，再 CLI `onboard(mode)`。
+   * 成功后后台启动 `start_chrome_debug_keepalive`（可用 COPAW_ZERO_TOKEN_KEEPALIVE=0 关闭）。
+   */
+  async authorizeWebModel(modelId: string): Promise<{
+    modelId: string
+    ensure: { output: string; result: unknown }
+    onboard: { mode: string; output: string }
+  }> {
+    const urls = ensureUrlsForCanonicalModelId(modelId)
+    const mode = onboardModeForCanonicalModelId(modelId)
+    if (!urls?.length || !mode) {
+      throw ApiError.badRequest(`Unknown zero-token web model id: ${modelId}`)
+    }
+    const ensure = await this.ensureChromeDebug(urls)
+    const onboardResult = await this.onboard(mode)
+    await this.spawnKeepaliveDetached(urls)
+    return {
+      modelId,
+      ensure,
+      onboard: { mode: onboardResult.mode, output: onboardResult.output },
+    }
+  }
+
+  /** 与 `authorizeWebModel` 相同步骤，但通过回调推送行级日志（供 NDJSON 流式 API） */
+  async authorizeWebModelStreaming(
+    modelId: string,
+    emit: (e: ZeroTokenAuthorizeStreamEvent) => void,
+  ): Promise<void> {
+    const urls = ensureUrlsForCanonicalModelId(modelId)
+    const mode = onboardModeForCanonicalModelId(modelId)
+    if (!urls?.length || !mode) {
+      throw ApiError.badRequest(`Unknown zero-token web model id: ${modelId}`)
+    }
+
+    emit({ type: 'phase', phase: 'ensure' })
+    const ensure = await this.ensureChromeDebug(urls, (line) => emit({ type: 'line', text: line }))
+
+    emit({ type: 'phase', phase: 'onboard' })
+    const onboardResult = await this.onboard(mode, (line) => emit({ type: 'line', text: line }))
+
+    emit({ type: 'phase', phase: 'keepalive' })
+    emit({ type: 'line', text: '正在启动 Chrome CDP 后台保活…' })
+    const keepaliveOutcome = await this.spawnKeepaliveDetached(urls)
+    if (keepaliveOutcome === 'started') {
+      emit({ type: 'line', text: '后台保活进程已启动（与 CoPaw 控制台行为一致）。' })
+    } else if (process.env.COPAW_ZERO_TOKEN_KEEPALIVE === '0') {
+      emit({ type: 'line', text: '已跳过后台保活（环境变量 COPAW_ZERO_TOKEN_KEEPALIVE=0）。' })
+    } else {
+      emit({ type: 'line', text: '已跳过后台保活（无可用 URL）。' })
+    }
+
+    emit({
+      type: 'complete',
+      result: {
+        modelId,
+        ensure,
+        onboard: { mode: onboardResult.mode, output: onboardResult.output },
+      },
+    })
+  }
+
+  /** 后台保活（CoPaw `start_chrome_debug_keepalive`）；新开会先尝试结束上一实例 */
+  async spawnKeepaliveDetached(urls: string[]): Promise<'skipped' | 'started'> {
+    if (process.env.COPAW_ZERO_TOKEN_KEEPALIVE === '0' || !urls.length) return 'skipped'
+    await killPreviousKeepalive()
+    const py = await resolvePythonExe()
+    try {
+      const child = Bun.spawn([py, '-c', COPAW_KEEPALIVE_SCRIPT], {
+        env: buildPythonEnv({
+          COPAW_KEEPALIVE_URLS_JSON: JSON.stringify(urls),
+        }),
+        stdout: 'ignore',
+        stderr: 'ignore',
+        stdin: 'ignore',
+      })
+      await writeKeepalivePid(child.pid)
+      return 'started'
+    } catch (error) {
+      throw ApiError.internal(
+        error instanceof Error ? error.message : String(error ?? 'keepalive spawn failed'),
+      )
+    }
+  }
+
+  async checkCdp(): Promise<{
+    ok: boolean
+    url: string
+    status: number | null
+    wsUrl: string | null
+    bodyPreview: string
+    error?: string
+  }> {
+    const url = 'http://127.0.0.1:9222/json/version'
+    try {
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 2_500)
+      const res = await fetch(url, { signal: controller.signal })
+      clearTimeout(timeoutId)
+      const text = await res.text()
+      const preview = text.slice(0, 800)
+      let wsUrl: string | null = null
+      try {
+        const parsed = JSON.parse(text) as Record<string, unknown>
+        if (typeof parsed.webSocketDebuggerUrl === 'string') wsUrl = parsed.webSocketDebuggerUrl
+      } catch {
+        wsUrl = null
+      }
+      return {
+        ok: res.ok,
+        url,
+        status: res.status,
+        wsUrl,
+        bodyPreview: preview,
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        url,
+        status: null,
+        wsUrl: null,
+        bodyPreview: '',
+        error: error instanceof Error ? error.message : String(error),
+      }
+    }
+  }
+
+  async status(): Promise<ZeroTokenGatewayStatus> {
+    return statusGatewayDirect()
+  }
+
+  getDeepseekToolMode(): DeepseekToolMode {
+    return readDeepseekToolMode()
+  }
+
+  async setDeepseekToolMode(mode: DeepseekToolMode): Promise<void> {
+    if (mode !== 'dsml' && mode !== 'xml') {
+      throw ApiError.badRequest('deepseekToolMode must be "dsml" or "xml"')
+    }
+    await setDeepseekToolMode(mode)
+  }
+
+  /** 仅通过 `POST /api/zero-token/start`（设置页）等显式入口调用；勿在 WebSocket 聊天或 ConversationService spawn 路径兜底调用。 */
+  async start(port?: number): Promise<ZeroTokenGatewayStatus> {
+    return startGatewayDirect(port)
+  }
+
+  async stop(): Promise<ZeroTokenGatewayStatus> {
+    await this.stopKeepalive()
+    return stopGatewayDirect()
+  }
+
+  async stopKeepalive(): Promise<void> {
+    await killPreviousKeepalive()
+  }
+}
+
+/** 与 `/api/zero-token`、代理转发共用同一实例（网关 PID、npm 安装状态一致）。 */
+export const sharedZeroTokenService = new ZeroTokenService()
