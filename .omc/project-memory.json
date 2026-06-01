@@ -1,0 +1,244 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1778163915934,
+  "projectRoot": "D:\\cc-haha",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      },
+      {
+        "name": "TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "tsconfig.json"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "react",
+        "version": "19.2.4",
+        "category": "frontend"
+      },
+      {
+        "name": "vue",
+        "version": "3.5.13",
+        "category": "frontend"
+      }
+    ],
+    "packageManager": "npm",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": "npm run start",
+    "scripts": {
+      "claude-haha": "bun run ./bin/claude-haha",
+      "start": "bun run ./bin/claude-haha",
+      "docs:dev": "vitepress dev docs",
+      "docs:build": "vitepress build docs",
+      "docs:preview": "vitepress preview docs"
+    }
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": "type-based"
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "bin",
+      "docs",
+      "scripts",
+      "src"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "adapters": {
+      "path": "adapters",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1778163915736,
+      "keyFiles": [
+        "bun.lock",
+        "package.json",
+        "README.md",
+        "tsconfig.json"
+      ]
+    },
+    "bin": {
+      "path": "bin",
+      "purpose": "Executable scripts",
+      "fileCount": 1,
+      "lastAccessed": 1778163915737,
+      "keyFiles": [
+        "claude-haha"
+      ]
+    },
+    "desktop": {
+      "path": "desktop",
+      "purpose": null,
+      "fileCount": 9,
+      "lastAccessed": 1778163915737,
+      "keyFiles": [
+        "bun.lock",
+        "bunfig.toml",
+        "index.html",
+        "package.json",
+        "pnpm-lock.yaml"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 1,
+      "lastAccessed": 1778163915738,
+      "keyFiles": [
+        "index.md"
+      ]
+    },
+    "fixtures": {
+      "path": "fixtures",
+      "purpose": "Test fixtures",
+      "fileCount": 1,
+      "lastAccessed": 1778163915739,
+      "keyFiles": [
+        "e8c7b0.json"
+      ]
+    },
+    "release-notes": {
+      "path": "release-notes",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1778163915740,
+      "keyFiles": [
+        "v0.1.2.md"
+      ]
+    },
+    "runtime": {
+      "path": "runtime",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1778163915741,
+      "keyFiles": [
+        "mac_helper.py",
+        "requirements-win.txt",
+        "requirements.txt",
+        "test_helpers.py",
+        "win_helper.py"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 2,
+      "lastAccessed": 1778163915742,
+      "keyFiles": [
+        "count-app-loc.ts",
+        "release.ts"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 19,
+      "lastAccessed": 1778163915743,
+      "keyFiles": [
+        "commands.ts",
+        "context.ts",
+        "cost-tracker.ts",
+        "costHook.ts",
+        "dialogLaunchers.tsx"
+      ]
+    },
+    "stubs": {
+      "path": "stubs",
+      "purpose": "Stub implementations",
+      "fileCount": 2,
+      "lastAccessed": 1778163915744,
+      "keyFiles": [
+        "ant-claude-for-chrome-mcp.ts",
+        "color-diff-napi.ts"
+      ]
+    },
+    "desktop\\public": {
+      "path": "desktop\\public",
+      "purpose": "Public files",
+      "fileCount": 1,
+      "lastAccessed": 1778163915747,
+      "keyFiles": [
+        "app-icon.jpg"
+      ]
+    },
+    "desktop\\scripts": {
+      "path": "desktop\\scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 4,
+      "lastAccessed": 1778163915749,
+      "keyFiles": [
+        "build-macos-arm64.sh",
+        "build-sidecars.ts",
+        "build-windows-x64.ps1"
+      ]
+    },
+    "desktop\\src": {
+      "path": "desktop\\src",
+      "purpose": "Source code",
+      "fileCount": 2,
+      "lastAccessed": 1778163915754,
+      "keyFiles": [
+        "App.tsx",
+        "main.tsx"
+      ]
+    },
+    "src\\components": {
+      "path": "src\\components",
+      "purpose": "UI components",
+      "fileCount": 115,
+      "lastAccessed": 1778163915785,
+      "keyFiles": [
+        "AgentProgressLine.tsx",
+        "AntModelSwitchCallout.ts",
+        "App.tsx"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "C:\\Users\\hahay\\.claude\\plugins\\marketplaces\\omc\\skills\\omc-setup\\phases\\01-install-claude-md.md",
+      "accessCount": 1,
+      "lastAccessed": 1778164875419,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hahay\\.claude\\plugins\\marketplaces\\omc\\skills\\omc-setup\\phases\\02-configure.md",
+      "accessCount": 1,
+      "lastAccessed": 1778164929075,
+      "type": "file"
+    },
+    {
+      "path": "C:\\Users\\hahay\\.claude\\hud\\omc-hud.mjs",
+      "accessCount": 1,
+      "lastAccessed": 1778165286714,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

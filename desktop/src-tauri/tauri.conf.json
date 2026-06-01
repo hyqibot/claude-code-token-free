@@ -1,0 +1,82 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/nicegui/static/tauri-schema-v2.json",
+  "productName": "Claude Code token free",
+  "version": "1.0.0",
+  "identifier": "com.claude-code-haha.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "bun run build:sidecars && bun run dev",
+    "beforeBuildCommand": "bun run build && bun run build:sidecars"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Claude Code token free",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 960,
+        "minHeight": 640,
+        "decorations": true,
+        "transparent": false,
+        "acceptFirstMouse": true
+      }
+    ],
+    "security": {
+      "dangerousDisableAssetCspModification": ["style-src"],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: https://asset.localhost; font-src 'self' data:; connect-src 'self' ws://127.0.0.1:* http://127.0.0.1:* ws://localhost:* http://localhost:*; media-src 'self' blob:"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFCRkYzRjI4RThFNkZDRUEKUldUcS9PYm9LRC8vRyswL1krM0VpRGx3NzJEci9mRi9WMEFGZHhseDMraW9WTUh6b2trV2ZUdDYK",
+      "endpoints": [
+        "https://github.com/hyqibot/claude-code-token-free/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows-installer-hooks.nsh"
+      }
+    },
+    "externalBin": [
+      "binaries/claude-sidecar",
+      "binaries/zero-token-gateway",
+      "binaries/zero-token-webauth-runner"
+    ],
+    "resources": {
+      "../build-artifacts/zero-token-runtime/": "zero-token-runtime/"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "dmg": {
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        },
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "description": "docs/reference 中仅 fixes.md、project-structure.md（及 en 对应）对用户公开；其余为开发者备忘，不进入 VitePress 站点与公开仓同步。",
+  "userReferenceDocs": [
+    "docs/reference/fixes.md",
+    "docs/reference/project-structure.md",
+    "docs/en/reference/fixes.md",
+    "docs/en/reference/project-structure.md"
+  ],
+  "developerReferenceDocs": [
+    "docs/reference/claude-official-models.md",
+    "docs/reference/desktop-release-and-updater.md",
+    "docs/reference/license-server-edgeone-pages.md",
+    "docs/reference/zero-token-azure-openai-placeholder.md",
+    "docs/reference/zero-token-gateway-exe-run-and-release.md",
+    "docs/reference/zero-token-gateway-sidecar-b1.md",
+    "docs/reference/zero-token-toolchain-refactor-plan.md",
+    "docs/reference/zero-token-web-toolchain.md",
+    "docs/reference/public-repo-sync-bootstrap.md"
+  ],
+  "publicPagesBase": "/claude-code-token-free/",
+  "publicPagesRepo": "hyqibot/claude-code-token-free"
+}

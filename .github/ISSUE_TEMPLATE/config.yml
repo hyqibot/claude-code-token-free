@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 下载最新版本
+    url: https://github.com/hyqibot/claude-code-token-free/releases
+    about: 从公开 Release 仓获取桌面端安装包
+  - name: 常见问题（FAQ）
+    url: https://github.com/hyqibot/claude-code-token-free/blob/main/docs/guide/faq.md
+    about: 提交 issue 前先查阅常见错误排查
