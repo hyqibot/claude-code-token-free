@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/hyqibot/claude-code-token-free/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
