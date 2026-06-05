@@ -1,0 +1,2 @@
+# 打包/同步脚本专用 bunfig：勿继承仓库根 preload.ts（会拉取 https-proxy-agent 等 CLI 依赖）。
+# 本文件不含 preload 字段；CI 用 bun --config=scripts/packaging/bunfig.toml 运行 sync 脚本。
