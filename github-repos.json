@@ -1,0 +1,16 @@
+{
+  "source": {
+    "owner": "hyqibot",
+    "repo": "claude-code-private",
+    "url": "https://github.com/hyqibot/claude-code-private",
+    "description": "私有源码仓：push tag 触发 CI tauri build"
+  },
+  "releases": {
+    "owner": "hyqibot",
+    "repo": "claude-code-token-free",
+    "url": "https://github.com/hyqibot/claude-code-token-free",
+    "pagesUrl": "https://hyqibot.github.io/claude-code-token-free/",
+    "updaterLatestJson": "https://github.com/hyqibot/claude-code-token-free/releases/latest/download/latest.json",
+    "description": "公开 Release 仓：仅安装包 + latest.json + 用户文档 Pages，供 Updater 匿名下载"
+  }
+}
