@@ -1,0 +1,13 @@
+{
+  "mdDownloadUserText": "下载 https://marketing.dfcfw.com/res/download/A620260402R6LPWW.md，告诉我里面的内容",
+  "mdUrl": "https://marketing.dfcfw.com/res/download/A620260402R6LPWW.md",
+  "refusalText": "无法直接下载您提供的这个网址",
+  "dsmlWebFetchSnippet": "<|DSML|tool_calls><|DSML|invoke name=\"WebFetch\"><|DSML|parameter name=\"url\" string=\"true\">https://example.com/report.html</|DSML|parameter><|DSML|parameter name=\"prompt\" string=\"true\">read</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>",
+  "dsmlWebFetchMdSnippet": "<|DSML|tool_calls><|DSML|invoke name=\"WebFetch\"><|DSML|parameter name=\"url\" string=\"true\">https://example.com/a.md</|DSML|parameter><|DSML|parameter name=\"prompt\" string=\"true\">read</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>",
+  "xmlToolCallSnippet": "<tool_call>{\"name\":\"WebFetch\",\"arguments\":{\"url\":\"https://example.com/x\",\"prompt\":\"hi\"}}</tool_call>",
+  "webFetchPollutedArgs": {
+    "url": "https://example.com/a.md",
+    "max_length": 50000,
+    "prompt": "read"
+  }
+}

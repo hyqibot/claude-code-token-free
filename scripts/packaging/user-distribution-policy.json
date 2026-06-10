@@ -1,0 +1,22 @@
+{
+  "description": "用户安装包/桌面发版产物中不得包含的路径或内容特征（运维专用 license-server 仅单独部署）",
+  "forbiddenPathSegments": [
+    "license-server/",
+    "license-server\\",
+    "scripts/run-license-server",
+    "vendor/copaw-zero-token/webauth-ts/",
+    "vendor\\copaw-zero-token\\webauth-ts\\",
+    "webauth-sites.ts"
+  ],
+  "forbiddenContentSubstrings": [
+    "GATEWAY_LICENSE_VENDOR_ENCRYPT_KEY",
+    "GATEWAY_LICENSE_VENDOR_SIGN_SALT",
+    "license-server/src/provider/vendorClient",
+    "api.ruikeyz.com/NetVer/webapi"
+  ],
+  "allowedInSidecarClientCode": [
+    "gatewayLicense",
+    "license.serverUrl",
+    "GATEWAY_LICENSE_API_SECRET"
+  ]
+}

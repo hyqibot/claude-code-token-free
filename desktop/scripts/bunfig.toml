@@ -1,0 +1,2 @@
+# Desktop 打包/sidecar 脚本专用：勿继承仓库根 preload.ts（会拉取 CLI 依赖并在 Windows 上误解析 bun:bundle）。
+# build:sidecars 用 bun --config=desktop/scripts/bunfig.toml 运行；本文件不含 preload 字段。
